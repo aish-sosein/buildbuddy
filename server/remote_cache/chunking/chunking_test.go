@@ -62,7 +62,7 @@ func TestChunker_ReassemblesOriginalData(t *testing.T) {
 	}
 
 	const averageSize = 64 * 1024
-	c, err := chunking.NewChunker(ctx, averageSize, writeChunkFn)
+	c, err := chunking.NewChunker(ctx, averageSize, 0, writeChunkFn)
 	require.NoError(t, err)
 
 	_, err = c.Write(originalData)
@@ -219,7 +219,7 @@ func TestChunker_DeterministicChunking(t *testing.T) {
 			return nil
 		}
 
-		c, err := chunking.NewChunker(ctx, averageSize, writeChunkFn)
+		c, err := chunking.NewChunker(ctx, averageSize, 0, writeChunkFn)
 		require.NoError(t, err)
 
 		_, err = c.Write(originalData)
@@ -237,6 +237,27 @@ func TestChunker_DeterministicChunking(t *testing.T) {
 	}
 }
 
+func TestChunker_UsesFastCDCSeed(t *testing.T) {
+	originalData := make([]byte, 1024*1024)
+	_, err := rand.Read(originalData)
+	require.NoError(t, err)
+
+	chunkSizes := func(seed uint32) []int {
+		var sizes []int
+		c, err := chunking.NewChunker(t.Context(), 64*1024, uint64(seed), func(data []byte) error {
+			sizes = append(sizes, len(data))
+			return nil
+		})
+		require.NoError(t, err)
+		_, err = c.Write(originalData)
+		require.NoError(t, err)
+		require.NoError(t, c.Close())
+		return sizes
+	}
+
+	assert.NotEqual(t, chunkSizes(0), chunkSizes(1))
+}
+
 func TestChunker_ContextCancellation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 
@@ -245,7 +266,7 @@ func TestChunker_ContextCancellation(t *testing.T) {
 	}
 
 	const averageSize = 16 * 1024
-	c, err := chunking.NewChunker(ctx, averageSize, writeChunkFn)
+	c, err := chunking.NewChunker(ctx, averageSize, 0, writeChunkFn)
 	require.NoError(t, err)
 
 	cancel()
@@ -278,7 +299,7 @@ func TestStoreAndLoad(t *testing.T) {
 			require.NoError(t, err)
 
 			var chunkDigests []*repb.Digest
-			c, err := chunking.NewChunker(ctx, int(chunking.AvgChunkSizeBytes()), func(data []byte) error {
+			c, err := chunking.NewChunker(ctx, int(chunking.AvgChunkSizeBytes()), 0, func(data []byte) error {
 				d, err := digest.Compute(bytes.NewReader(data), repb.DigestFunction_SHA256)
 				if err != nil {
 					return err
@@ -341,7 +362,7 @@ func TestStore_MissingChunk(t *testing.T) {
 	require.NoError(t, err)
 
 	var chunkDigests []*repb.Digest
-	c, err := chunking.NewChunker(ctx, int(chunking.AvgChunkSizeBytes()), func(data []byte) error {
+	c, err := chunking.NewChunker(ctx, int(chunking.AvgChunkSizeBytes()), 0, func(data []byte) error {
 		d, err := digest.Compute(bytes.NewReader(data), repb.DigestFunction_SHA256)
 		if err != nil {
 			return err

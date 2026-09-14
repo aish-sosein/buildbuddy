@@ -50,6 +50,8 @@ import (
 
 const (
 	defaultChunkTransferConcurrency = 32
+	fastCDCParamsCacheTTL           = 5 * time.Minute
+	fastCDCParamsFetchTimeout       = 10 * time.Second
 )
 
 var (
@@ -82,14 +84,18 @@ func (s *ByteStreamServerProxy) shouldBypassLocalCacheForEncryption(ctx context.
 }
 
 type ByteStreamServerProxy struct {
-	supportsEncryption func(context.Context) bool
-	authenticator      interfaces.Authenticator
-	local              interfaces.ByteStreamServer
-	remote             bspb.ByteStreamClient
-	efp                interfaces.ExperimentFlagProvider
-	localCache         interfaces.Cache
-	remoteCAS          repb.ContentAddressableStorageClient
-	bufPool            *bytebufferpool.VariableSizePool
+	supportsEncryption  func(context.Context) bool
+	authenticator       interfaces.Authenticator
+	local               interfaces.ByteStreamServer
+	remote              bspb.ByteStreamClient
+	efp                 interfaces.ExperimentFlagProvider
+	localCache          interfaces.Cache
+	remoteCAS           repb.ContentAddressableStorageClient
+	capabilitiesClient  repb.CapabilitiesClient
+	bufPool             *bytebufferpool.VariableSizePool
+	fastCDCParamsMu     sync.Mutex
+	fastCDCParams       *repb.FastCdc2020Params
+	fastCDCParamsExpiry time.Time
 }
 
 func Register(env *real_environment.RealEnv) error {
@@ -122,6 +128,7 @@ func New(env environment.Env) (*ByteStreamServerProxy, error) {
 		efp:                env.GetExperimentFlagProvider(),
 		localCache:         env.GetCache(),
 		remoteCAS:          env.GetContentAddressableStorageClient(),
+		capabilitiesClient: env.GetCapabilitiesClient(),
 		bufPool:            bytebufferpool.VariableSize(int(chunking.MaxCompressedChunkReadSizeBytes())),
 	}, nil
 }
@@ -1216,6 +1223,29 @@ func (s *replayableWriteStream) Recv() (*bspb.WriteRequest, error) {
 	return s.ByteStream_WriteServer.Recv()
 }
 
+func (s *ByteStreamServerProxy) remoteFastCDCParams(ctx context.Context, instanceName string) (*repb.FastCdc2020Params, error) {
+	if s.capabilitiesClient == nil {
+		return nil, status.UnimplementedError("capabilities client not configured")
+	}
+	s.fastCDCParamsMu.Lock()
+	defer s.fastCDCParamsMu.Unlock()
+	if time.Now().Before(s.fastCDCParamsExpiry) {
+		return s.fastCDCParams, nil
+	}
+	ctx, cancel := context.WithTimeout(ctx, fastCDCParamsFetchTimeout)
+	defer cancel()
+	rsp, err := s.capabilitiesClient.GetCapabilities(ctx, &repb.GetCapabilitiesRequest{InstanceName: instanceName})
+	if err != nil {
+		return nil, err
+	}
+	s.fastCDCParams = nil
+	if cacheCapabilities := rsp.GetCacheCapabilities(); cacheCapabilities.GetSpliceBlobSupport() {
+		s.fastCDCParams = cacheCapabilities.GetFastCdc_2020Params()
+	}
+	s.fastCDCParamsExpiry = time.Now().Add(fastCDCParamsCacheTTL)
+	return s.fastCDCParams, nil
+}
+
 func (s *ByteStreamServerProxy) writeChunkingEnabled(ctx context.Context) bool {
 	if *disableCDC || s.localCache == nil || s.remoteCAS == nil {
 		return false
@@ -1255,8 +1285,20 @@ func (s *ByteStreamServerProxy) writeChunked(ctx context.Context, stream bspb.By
 		return writeChunkedResult{}, status.InvalidArgumentErrorf("parse resource name: %s", err)
 	}
 
+	params, err := s.remoteFastCDCParams(ctx, rn.GetInstanceName())
+	if err != nil {
+		return writeChunkedResult{firstReq: firstReq}, status.UnimplementedErrorf("fetch FastCDC params: %s", err)
+	}
+	avgChunkSizeBytes := params.GetAvgChunkSizeBytes()
+	if avgChunkSizeBytes < 1024 || avgChunkSizeBytes > uint64(chunking.MaxSupportedChunkSizeBytes()/4) {
+		return writeChunkedResult{firstReq: firstReq}, status.UnimplementedError("server does not advertise supported FastCDC params")
+	}
+
 	blobSize := rn.GetDigest().GetSizeBytes()
-	if !chunking.ShouldUploadChunked(ctx, s.efp, rn.GetDigest()) {
+	// This eligibility limit can vary by request, so it is not cached with the
+	// backend's chunking algorithm parameters.
+	maxWriteSizeBytes := chunking.MaxWriteSizeBytes(ctx, s.efp)
+	if !chunking.ShouldUploadChunkedWithMax(rn.GetDigest(), int64(avgChunkSizeBytes), maxWriteSizeBytes) {
 		return writeChunkedResult{firstReq: firstReq}, status.UnimplementedError("blob outside chunking size range")
 	}
 
@@ -1345,7 +1387,7 @@ func (s *ByteStreamServerProxy) writeChunked(ctx context.Context, stream bspb.By
 		return nil
 	}
 
-	chunker, err := chunking.NewChunker(ctx, int(chunking.AvgChunkSizeBytes()), chunkWriteFn)
+	chunker, err := chunking.NewChunker(ctx, int(avgChunkSizeBytes), uint64(params.GetSeed()), chunkWriteFn)
 	if err != nil {
 		return writeChunkedResult{}, status.InternalErrorf("creating chunker: %s", err)
 	}
