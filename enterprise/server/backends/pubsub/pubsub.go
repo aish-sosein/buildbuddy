@@ -2,11 +2,15 @@ package pubsub
 
 import (
 	"context"
+	"errors"
 	"strings"
+	"sync"
 	"time"
 
+	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/redisutil"
 	"github.com/buildbuddy-io/buildbuddy/server/interfaces"
 	"github.com/buildbuddy-io/buildbuddy/server/util/alert"
+	"github.com/buildbuddy-io/buildbuddy/server/util/flag"
 	"github.com/buildbuddy-io/buildbuddy/server/util/log"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
 	"github.com/go-redis/redis/v8"
@@ -16,6 +20,29 @@ const (
 	// Error detail reason indicating that there was a problem reading from the
 	// pubsub channel.
 	pubsubChannelErrorReason = "PUBSUB_CHANNEL_ERROR"
+
+	// batchedCheckAttempts is how many pipelines in a row a batched check
+	// may fail to get an answer before its subscription is told. An
+	// unanswered read is a timeout, a dropped connection, or a reply such as
+	// LOADING, which a read on its own would have retried inside the client.
+	// A missing stream is reported by the first pipeline that reads it.
+	// Every subscription on a shard shares the shard's fate, so when the
+	// attempts run out they all fail on the same execution.
+	batchedCheckAttempts = 3
+
+	// batchedCheckTimeout bounds one execution of the shared pipeline. It
+	// matches the client's read timeout, so an execution is one full read
+	// attempt and retrying happens across pipelines, in check, rather than
+	// inside the client. The pipeline covers every shard and finishes with
+	// the slowest, so a hung shard delays every subscription's check by this
+	// long, and when the deadline cuts a shard's pipeline short the client
+	// marks that shard's already-answered reads as failed too, costing them
+	// an attempt.
+	batchedCheckTimeout = 3 * time.Second
+)
+
+var (
+	batchMonitoredStreamChecks = flag.Bool("remote_execution.pubsub_batch_monitored_stream_checks", false, "Check the monitored pubsub streams of all subscriptions with one pipeline per interval, split by shard, instead of one read per subscription per interval.")
 )
 
 type PubSub struct {
@@ -92,12 +119,16 @@ const (
 )
 
 type StreamPubSub struct {
-	rdb redis.UniversalClient
+	rdb     redis.UniversalClient
+	checker *streamExistenceChecker
 }
 
 // NewStreamPubSub creates a PubSub client based on a Redis-stream.
 func NewStreamPubSub(redisClient redis.UniversalClient) *StreamPubSub {
-	return &StreamPubSub{rdb: redisClient}
+	return &StreamPubSub{
+		rdb:     redisClient,
+		checker: newStreamExistenceChecker(redisClient, monitoredChannelExistenceCheckInterval),
+	}
 }
 
 type Channel struct {
@@ -148,7 +179,7 @@ func (s *StreamSubscription) Chan() <-chan *Message {
 	return s.ch
 }
 
-func (p *StreamPubSub) extractMsgData(channel *Channel, msg *redis.XMessage) (string, error) {
+func extractMsgData(channel *Channel, msg *redis.XMessage) (string, error) {
 	data, ok := msg.Values[streamDataField]
 	if !ok {
 		return "", status.FailedPreconditionErrorf("Message %q on stream %q missing data field", msg.ID, channel.name)
@@ -169,7 +200,7 @@ func deliverError(ctx context.Context, outCh chan *Message, err error) {
 }
 
 func (p *StreamPubSub) deliverMsg(ctx context.Context, psChannel *Channel, outCh chan *Message, msg *redis.XMessage) bool {
-	data, err := p.extractMsgData(psChannel, msg)
+	data, err := extractMsgData(psChannel, msg)
 	if err != nil {
 		alert.UnexpectedEvent("could not extract PubSub message contents", "error: %s", err)
 		return false
@@ -187,10 +218,24 @@ func (p *StreamPubSub) deliverMsg(ctx context.Context, psChannel *Channel, outCh
 }
 
 func (p *StreamPubSub) checkMonitoredChannelExists(ctx context.Context, channel *Channel) error {
+	if *batchMonitoredStreamChecks {
+		// A batched check waits for the next pipeline, up to an interval, so
+		// a subscription's first check reports a lost stream up to that much
+		// later than a read of its own would.
+		return p.checker.check(ctx, channel)
+	}
 	result, err := p.rdb.XRead(ctx, &redis.XReadArgs{
 		Streams: []string{channel.name, "0"},
+		Count:   1,
 		Block:   -1, // No blocking.
 	}).Result()
+	return checkMonitoredStreamResult(channel, result, err)
+}
+
+// checkMonitoredStreamResult interprets a read from the start of a monitored
+// stream: the stream must exist and begin with the marker written when it
+// was created, otherwise Redis has lost it.
+func checkMonitoredStreamResult(channel *Channel, result []redis.XStream, err error) error {
 	if err == redis.Nil {
 		return status.UnavailableErrorf("PubSub channel %q disappeared", channel.name)
 	}
@@ -204,7 +249,7 @@ func (p *StreamPubSub) checkMonitoredChannelExists(ctx context.Context, channel 
 	if len(stream.Messages) == 0 {
 		return status.UnavailableErrorf("PubSub channel %q disappeared", channel.name)
 	}
-	data, err := p.extractMsgData(channel, &stream.Messages[0])
+	data, err := extractMsgData(channel, &stream.Messages[0])
 	if err != nil {
 		return status.UnavailableErrorf("unable to check existence of PubSub channel %q", channel.name)
 	}
@@ -349,4 +394,97 @@ func (p *StreamPubSub) Publish(ctx context.Context, channel *Channel, message st
 
 func (p *StreamPubSub) Expire(ctx context.Context, channel *Channel, d time.Duration) error {
 	return p.rdb.Expire(ctx, channel.name, d).Err()
+}
+
+// streamExistenceChecker batches the stream existence checks of many
+// subscriptions into shared pipelines. A check queues its read on the current
+// pipeline and waits for it to be executed, which happens once per interval,
+// so a shard sees one pipeline per interval per app instead of a read per
+// subscription.
+type streamExistenceChecker struct {
+	rdb      redis.UniversalClient
+	interval time.Duration
+
+	mu sync.Mutex // mu protects: pipe, executed
+	// pipe collects reads until it is executed; nil when nothing is queued.
+	// executed is closed once pipe has been executed.
+	pipe     redis.Pipeliner
+	executed chan struct{}
+}
+
+func newStreamExistenceChecker(rdb redis.UniversalClient, interval time.Duration) *streamExistenceChecker {
+	return &streamExistenceChecker{rdb: rdb, interval: interval}
+}
+
+// check reads the start of the stream through the shared pipeline and
+// interprets the reply the way checkMonitoredStreamResult does. A read that
+// never reached Redis says nothing about the stream, so it is queued again
+// on the next pipeline, up to batchedCheckAttempts in a row, before it is
+// reported. Waiting for the next pipeline is already an interval apart, so
+// there is no backoff beyond that.
+func (c *streamExistenceChecker) check(ctx context.Context, channel *Channel) error {
+	for attempt := 1; ; attempt++ {
+		read, executed := c.queue(channel)
+		select {
+		case <-executed:
+		case <-ctx.Done():
+			return checkMonitoredStreamResult(channel, nil, ctx.Err())
+		}
+		result, err := read.Result()
+		if !retryable(err) {
+			return checkMonitoredStreamResult(channel, result, err)
+		}
+		if attempt == batchedCheckAttempts {
+			return status.UnavailableErrorf("unable to check existence of PubSub channel %q after %d attempts: %s", channel.name, attempt, err)
+		}
+	}
+}
+
+// queue adds a read of the stream's first entry to the current pipeline,
+// starting one and scheduling its execution if none is open, and returns the
+// read along with the channel that closes once it has been executed.
+func (c *streamExistenceChecker) queue(channel *Channel) (*redis.XStreamSliceCmd, chan struct{}) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if c.pipe == nil {
+		c.pipe = c.rdb.Pipeline()
+		c.executed = make(chan struct{})
+		time.AfterFunc(c.interval, c.execute)
+	}
+	read := c.pipe.XRead(context.Background(), &redis.XReadArgs{
+		Streams: []string{channel.name, "0"},
+		Count:   1,
+		Block:   -1, // No blocking.
+	})
+	return read, c.executed
+}
+
+// execute runs the current pipeline and releases the checks waiting on it.
+// Each read's own result says what happened to its stream. A failure to
+// reach Redis is logged here, once per execution, because it otherwise only
+// surfaces as each affected subscription failing on its own.
+func (c *streamExistenceChecker) execute() {
+	c.mu.Lock()
+	pipe, executed := c.pipe, c.executed
+	c.pipe, c.executed = nil, nil
+	c.mu.Unlock()
+	ctx, cancel := context.WithTimeout(context.Background(), batchedCheckTimeout)
+	defer cancel()
+	cmds, _ := pipe.Exec(ctx)
+	for _, cmd := range cmds {
+		if err := cmd.Err(); retryable(err) {
+			log.Warningf("Batched pubsub stream check of %d streams could not reach Redis: %s", len(cmds), err)
+			break
+		}
+	}
+	close(executed)
+}
+
+// retryable returns whether a pipelined read should be issued again. The
+// ring's shard clients don't retry pipelines at all, and no client retries
+// an error reply inside one, so this follows the retry logic go-redis
+// applies to individually issued commands. The deadline it also accepts is
+// execute's own; the subscriber's context never reaches the pipeline.
+func retryable(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) || redisutil.IsTransientError(err)
 }

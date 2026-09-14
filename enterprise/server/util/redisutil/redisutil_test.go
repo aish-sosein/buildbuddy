@@ -6,7 +6,9 @@ import (
 	"crypto/rand"
 	"crypto/tls"
 	"fmt"
+	"io"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"testing"
@@ -681,6 +683,50 @@ func BenchmarkCommandBuffer_Flush_HIncrBy(b *testing.B) {
 				err := buf.Flush(ctx)
 				require.NoError(b, err)
 			}
+		})
+	}
+}
+
+// fakeRedisError stands in for a reply Redis returns as an error, which the
+// client represents with a type internal to it.
+type fakeRedisError string
+
+func (e fakeRedisError) Error() string { return string(e) }
+func (fakeRedisError) RedisError()     {}
+
+// fakeNetTimeout behaves like the net package's timeout error, which is
+// unexported: it is a net.Error that timed out and also reports itself as
+// context.DeadlineExceeded through errors.Is.
+type fakeNetTimeout struct{}
+
+func (fakeNetTimeout) Error() string     { return "i/o timeout" }
+func (fakeNetTimeout) Timeout() bool     { return true }
+func (fakeNetTimeout) Temporary() bool   { return true }
+func (fakeNetTimeout) Is(err error) bool { return err == context.DeadlineExceeded }
+
+func TestIsTransientError(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		err       error
+		transient bool
+	}{
+		{name: "nil", err: nil, transient: false},
+		{name: "canceled context", err: context.Canceled, transient: false},
+		{name: "expired context", err: context.DeadlineExceeded, transient: false},
+		{name: "wrapped expired context", err: fmt.Errorf("read stream: %w", context.DeadlineExceeded), transient: false},
+		{name: "dropped connection", err: io.EOF, transient: true},
+		{name: "timeout", err: os.ErrDeadlineExceeded, transient: true},
+		{name: "dial timeout", err: &net.OpError{Op: "dial", Err: fakeNetTimeout{}}, transient: true},
+		{name: "missing key", err: redis.Nil, transient: false},
+		{name: "loading", err: fakeRedisError("LOADING Redis is loading the dataset in memory"), transient: true},
+		{name: "read only replica", err: fakeRedisError("READONLY You can't write against a read only replica."), transient: true},
+		{name: "too many clients", err: fakeRedisError("ERR max number of clients reached"), transient: true},
+		{name: "wrapped loading", err: fmt.Errorf("check stream: %w", fakeRedisError("LOADING Redis is loading the dataset in memory")), transient: true},
+		{name: "wrong type", err: fakeRedisError("WRONGTYPE Operation against a key holding the wrong kind of value"), transient: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			transient := redisutil.IsTransientError(tc.err)
+			require.Equal(t, tc.transient, transient)
 		})
 	}
 }

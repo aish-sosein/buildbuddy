@@ -2,12 +2,14 @@ package pubsub
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/testutil/testredis"
 	"github.com/buildbuddy-io/buildbuddy/enterprise/server/util/redisutil"
 	"github.com/buildbuddy-io/buildbuddy/server/util/status"
+	"github.com/buildbuddy-io/buildbuddy/server/util/testing/flags"
 	"github.com/go-redis/redis/v8"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -83,58 +85,117 @@ func TestStreamPubSub(t *testing.T) {
 }
 
 func TestMonitoredPubSub(t *testing.T) {
-	redisHandle := testredis.Start(t)
-	pubSub := NewStreamPubSub(redis.NewClient(redisutil.TargetToOptions(redisHandle.Target)))
+	// The stream can be checked once per subscription or once per interval
+	// for all subscriptions; a lost stream must surface either way.
+	for _, batched := range []bool{false, true} {
+		t.Run(fmt.Sprintf("batched=%t", batched), func(t *testing.T) {
+			flags.Set(t, "remote_execution.pubsub_batch_monitored_stream_checks", batched)
+			redisHandle := testredis.Start(t)
+			rdb := redis.NewClient(redisutil.TargetToOptions(redisHandle.Target))
+			pubSub := NewStreamPubSub(rdb)
 
-	ctx := context.Background()
+			ctx := t.Context()
 
-	err := pubSub.CreateMonitoredChannel(ctx, channel1Name)
-	require.NoError(t, err)
-	channel1 := pubSub.MonitoredChannel(channel1Name)
+			err := pubSub.CreateMonitoredChannel(ctx, channel1Name)
+			require.NoError(t, err)
+			channel1 := pubSub.MonitoredChannel(channel1Name)
 
-	subscriber := pubSub.SubscribeHead(ctx, channel1)
-	defer subscriber.Close()
-	requireNoMessages(t, subscriber)
+			subscriber := pubSub.SubscribeHead(ctx, channel1)
+			defer subscriber.Close()
+			requireNoMessages(t, subscriber)
 
-	// Publish a message and it should be immediately available to the subscriber.
-	err = pubSub.Publish(ctx, channel1, message1)
-	require.NoError(t, err)
-	requireMessages(t, subscriber, message1)
+			// Publish a message and it should be immediately available to the subscriber.
+			err = pubSub.Publish(ctx, channel1, message1)
+			require.NoError(t, err)
+			requireMessages(t, subscriber, message1)
 
-	redisHandle.Restart()
+			// Let at least one check complete against the intact stream, so
+			// the loss below has to be caught by a later check. Batched
+			// checks execute at most once per interval.
+			time.Sleep(monitoredChannelExistenceCheckInterval * 3 / 2)
 
-	err = requireError(t, subscriber)
-	require.True(t, status.IsUnavailableError(err), "expected UNAVAILABLE error but got %s", err)
-	require.Contains(t, err.Error(), "disappeared")
+			// Losing the stream, as a Redis restart would, must be reported by
+			// the check. Flushing rather than restarting keeps connections
+			// intact, so the subscription's own read can't fail first.
+			err = rdb.FlushAll(ctx).Err()
+			require.NoError(t, err)
+
+			err = requireError(t, subscriber)
+			require.True(t, status.IsUnavailableError(err), "expected UNAVAILABLE error but got %s", err)
+			require.Contains(t, err.Error(), "disappeared")
+		})
+	}
 }
 
 func TestDeleteMonitoredChannel(t *testing.T) {
+	// A deleted stream must surface whether it is checked per subscription
+	// or in the shared batch.
+	for _, batched := range []bool{false, true} {
+		t.Run(fmt.Sprintf("batched=%t", batched), func(t *testing.T) {
+			flags.Set(t, "remote_execution.pubsub_batch_monitored_stream_checks", batched)
+			redisHandle := testredis.Start(t)
+			pubSub := NewStreamPubSub(redis.NewClient(redisutil.TargetToOptions(redisHandle.Target)))
+
+			ctx := t.Context()
+
+			err := pubSub.CreateMonitoredChannel(ctx, channel1Name)
+			require.NoError(t, err)
+			channel1 := pubSub.MonitoredChannel(channel1Name)
+
+			subscriber := pubSub.SubscribeHead(ctx, channel1)
+			defer subscriber.Close()
+
+			err = pubSub.Publish(ctx, channel1, message1)
+			require.NoError(t, err)
+			requireMessages(t, subscriber, message1)
+
+			// Let at least one check complete against the intact stream, so
+			// the deletion below has to be caught by a later check. Batched
+			// checks execute at most once per interval.
+			time.Sleep(monitoredChannelExistenceCheckInterval * 3 / 2)
+
+			err = pubSub.DeleteMonitoredChannel(ctx, channel1Name)
+			require.NoError(t, err)
+
+			err = requireError(t, subscriber)
+			require.True(t, status.IsUnavailableError(err), "expected UNAVAILABLE error but got %s", err)
+			require.Contains(t, err.Error(), "disappeared")
+
+			// Deleting a non-existent channel should be a no-op.
+			err = pubSub.DeleteMonitoredChannel(ctx, channel1Name)
+			require.NoError(t, err)
+		})
+	}
+}
+
+func TestStreamExistenceChecker(t *testing.T) {
 	redisHandle := testredis.Start(t)
-	pubSub := NewStreamPubSub(redis.NewClient(redisutil.TargetToOptions(redisHandle.Target)))
+	rdb := redis.NewClient(redisutil.TargetToOptions(redisHandle.Target))
+	pubSub := NewStreamPubSub(rdb)
+	ctx := t.Context()
 
-	ctx := context.Background()
+	// A short interval keeps the checks quick; each check waits for the
+	// next pipeline execution.
+	interval := 50 * time.Millisecond
+	checker := newStreamExistenceChecker(rdb, interval)
 
+	// An intact stream checks clean, and a stream that was never created
+	// reports as disappeared on the first pipeline that reads it.
 	err := pubSub.CreateMonitoredChannel(ctx, channel1Name)
 	require.NoError(t, err)
-	channel1 := pubSub.MonitoredChannel(channel1Name)
-
-	subscriber := pubSub.SubscribeHead(ctx, channel1)
-	defer subscriber.Close()
-
-	err = pubSub.Publish(ctx, channel1, message1)
+	err = checker.check(ctx, pubSub.MonitoredChannel(channel1Name))
 	require.NoError(t, err)
-	requireMessages(t, subscriber, message1)
-
-	err = pubSub.DeleteMonitoredChannel(ctx, channel1Name)
-	require.NoError(t, err)
-
-	err = requireError(t, subscriber)
+	err = checker.check(ctx, pubSub.MonitoredChannel("never-created"))
 	require.True(t, status.IsUnavailableError(err), "expected UNAVAILABLE error but got %s", err)
 	require.Contains(t, err.Error(), "disappeared")
 
-	// Deleting a non-existent channel should be a no-op.
-	err = pubSub.DeleteMonitoredChannel(ctx, channel1Name)
-	require.NoError(t, err)
+	// With Redis gone, reads go unanswered. The check queues on later
+	// pipelines and only gives up after batchedCheckAttempts in a row, which
+	// its message records.
+	redisHandle.Shutdown()
+	err = checker.check(ctx, pubSub.MonitoredChannel(channel1Name))
+	require.True(t, status.IsUnavailableError(err), "expected UNAVAILABLE error but got %s", err)
+	require.Contains(t, err.Error(), fmt.Sprintf("after %d attempts", batchedCheckAttempts))
 }
 
 func requireNoMessages(t *testing.T, subscriber *StreamSubscription) {
@@ -183,7 +244,7 @@ func requireError(t *testing.T, subscriber *StreamSubscription) error {
 		}
 		require.Error(t, msg.Err, "subscriber should have returned an error")
 		return msg.Err
-	case <-time.After(2 * time.Second):
+	case <-time.After(5 * time.Second):
 		assert.FailNow(t, "expected to receive an error but none received")
 	}
 	return nil
